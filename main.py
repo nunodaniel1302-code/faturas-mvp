@@ -2,15 +2,14 @@ from datetime import date, datetime, timedelta
 from typing import Optional, List
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 
 from sqlmodel import SQLModel, Field, Session, create_engine, select
 import pandas as pd
 
 app = FastAPI(title="MVP Alertas de Faturas")
 
-# Permitir frontend depois (se quiseres). Para MVP local, ok assim.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,10 +18,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- DB (SQLite para começar; fácil migrar para Postgres depois)
+# SQLite simples para MVP (nota: em Render free pode reiniciar e perder dados)
 engine = create_engine("sqlite:///./app.db", echo=False)
 
 
+# ---------------- Models ----------------
 class Company(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     nome: str
@@ -42,6 +42,22 @@ class Invoice(SQLModel, table=True):
     estado: str = Field(default="EM_ABERTO", index=True)  # EM_ABERTO | PAGA
 
 
+class RecurringPayment(SQLModel, table=True):
+    """
+    Pagamentos recorrentes (ex.: Leasing por débito direto).
+    Aparecem sempre no dashboard como alerta fixo.
+    """
+    id: Optional[int] = Field(default=None, primary_key=True)
+    company_id: int = Field(index=True)
+
+    descricao: str
+    valor: Optional[float] = None
+
+    dia_mes: int = Field(default=1)  # 1..31 (calculamos próximo débito com segurança)
+    metodo: str = Field(default="DEBITO_DIRETO")
+    ativo: bool = Field(default=True)
+
+
 def create_db():
     SQLModel.metadata.create_all(engine)
 
@@ -51,9 +67,8 @@ def on_startup():
     create_db()
 
 
-# ---------- Helpers ----------
+# ---------------- Helpers ----------------
 REQUIRED_COLS = {"fornecedor", "numero_fatura", "data_emissao", "data_vencimento", "valor"}
-OPTIONAL_COLS = {"estado"}
 
 
 def parse_date_safe(v) -> date:
@@ -63,7 +78,6 @@ def parse_date_safe(v) -> date:
         return v
     if isinstance(v, datetime):
         return v.date()
-    # string
     return datetime.strptime(str(v).strip(), "%Y-%m-%d").date()
 
 
@@ -77,7 +91,7 @@ def normalize_estado(v) -> str:
 
 
 def read_file_to_df(upload: UploadFile) -> pd.DataFrame:
-    filename = upload.filename.lower()
+    filename = (upload.filename or "").lower()
     if filename.endswith(".csv"):
         return pd.read_csv(upload.file)
     if filename.endswith(".xlsx") or filename.endswith(".xls"):
@@ -85,7 +99,30 @@ def read_file_to_df(upload: UploadFile) -> pd.DataFrame:
     raise HTTPException(status_code=400, detail="Formato não suportado. Usa .csv ou .xlsx")
 
 
-# ---------- Endpoints ----------
+def next_due_date(dia_mes: int, today: Optional[date] = None) -> date:
+    """
+    Calcula a próxima data de débito para um pagamento recorrente.
+    Para evitar problemas com meses curtos, limitamos o dia a 28.
+    (Podemos melhorar depois para lidar com 29/30/31 com regras.)
+    """
+    today = today or date.today()
+    dia = max(1, min(int(dia_mes), 28))
+
+    this_month = date(today.year, today.month, dia)
+    if this_month >= today:
+        return this_month
+
+    if today.month == 12:
+        return date(today.year + 1, 1, dia)
+    return date(today.year, today.month + 1, dia)
+
+
+# ---------------- Endpoints API ----------------
+@app.get("/")
+def root():
+    return {"ok": True, "message": "API online. Vai a /docs, /ui ou /dashboard"}
+
+
 @app.post("/companies", response_model=Company)
 def create_company(company: Company):
     if not company.nome.strip():
@@ -104,24 +141,21 @@ def list_companies():
 
 
 @app.post("/companies/{company_id}/invoices/import")
-def import_invoices(company_id: int, file: UploadFile = File(...)):
-    # Verificar empresa
+async def import_invoices(company_id: int, file: UploadFile = File(...)):
+    # verificar empresa
     with Session(engine) as session:
         company = session.get(Company, company_id)
         if not company:
             raise HTTPException(404, "Empresa não encontrada")
 
+    file.file.seek(0)
     df = read_file_to_df(file)
     df.columns = [c.strip().lower() for c in df.columns]
 
     missing = REQUIRED_COLS - set(df.columns)
     if missing:
-        raise HTTPException(
-            400,
-            detail=f"Faltam colunas obrigatórias: {', '.join(sorted(missing))}"
-        )
+        raise HTTPException(400, detail=f"Faltam colunas obrigatórias: {', '.join(sorted(missing))}")
 
-    # Limpar e validar
     results = {"lidas": len(df), "importadas": 0, "atualizadas": 0, "erros": []}
 
     with Session(engine) as session:
@@ -129,7 +163,6 @@ def import_invoices(company_id: int, file: UploadFile = File(...)):
             try:
                 fornecedor = str(row["fornecedor"]).strip()
                 numero = str(row["numero_fatura"]).strip()
-
                 if not fornecedor or not numero:
                     raise ValueError("fornecedor/numero_fatura vazio")
 
@@ -138,7 +171,6 @@ def import_invoices(company_id: int, file: UploadFile = File(...)):
                 valor = float(row["valor"])
                 estado = normalize_estado(row["estado"]) if "estado" in df.columns else "EM_ABERTO"
 
-                # dedupe: por empresa + numero_fatura
                 existing = session.exec(
                     select(Invoice).where(
                         Invoice.company_id == company_id,
@@ -168,7 +200,7 @@ def import_invoices(company_id: int, file: UploadFile = File(...)):
                     results["importadas"] += 1
 
             except Exception as e:
-                results["erros"].append({"linha": int(i) + 2, "erro": str(e)})  # +2 por causa do header e index 0
+                results["erros"].append({"linha": int(i) + 2, "erro": str(e)})
 
         session.commit()
 
@@ -176,16 +208,11 @@ def import_invoices(company_id: int, file: UploadFile = File(...)):
 
 
 @app.get("/companies/{company_id}/invoices")
-def list_invoices(
-    company_id: int,
-    status: Optional[str] = None,  # "overdue" | "due_soon" | "paid" | None
-    days: int = 15,
-):
+def list_invoices(company_id: int, status: Optional[str] = None, days: int = 15):
     today = date.today()
     soon_limit = today + timedelta(days=days)
 
     with Session(engine) as session:
-        # base
         q = select(Invoice).where(Invoice.company_id == company_id)
 
         if status == "paid":
@@ -197,7 +224,6 @@ def list_invoices(
 
         invoices = session.exec(q.order_by(Invoice.data_vencimento)).all()
 
-    # Enriquecer com "categoria" simples para UI
     out = []
     for inv in invoices:
         if inv.estado == "PAGA":
@@ -223,6 +249,56 @@ def mark_invoice_paid(invoice_id: int):
         session.add(inv)
         session.commit()
         return {"ok": True, "invoice_id": invoice_id}
+
+
+# -------- Recurring payments (Leasing débito direto) --------
+@app.post("/companies/{company_id}/recurring")
+def add_recurring(company_id: int, item: RecurringPayment):
+    with Session(engine) as session:
+        company = session.get(Company, company_id)
+        if not company:
+            raise HTTPException(404, "Empresa não encontrada")
+
+        if item.dia_mes < 1 or item.dia_mes > 31:
+            raise HTTPException(400, "dia_mes deve estar entre 1 e 31")
+
+        rp = RecurringPayment(
+            company_id=company_id,
+            descricao=item.descricao,
+            valor=item.valor,
+            dia_mes=item.dia_mes,
+            metodo=item.metodo or "DEBITO_DIRETO",
+            ativo=True
+        )
+        session.add(rp)
+        session.commit()
+        session.refresh(rp)
+        return rp
+
+
+@app.get("/companies/{company_id}/recurring")
+def list_recurring(company_id: int):
+    today = date.today()
+    with Session(engine) as session:
+        items = session.exec(
+            select(RecurringPayment).where(
+                RecurringPayment.company_id == company_id,
+                RecurringPayment.ativo == True
+            ).order_by(RecurringPayment.id)
+        ).all()
+
+    out = []
+    for it in items:
+        nd = next_due_date(it.dia_mes, today)
+        out.append({
+            **it.model_dump(),
+            "proximo_debito": str(nd),
+            "dias_faltam": (nd - today).days
+        })
+    return out
+
+
+# ---------------- Simple UI (/ui) ----------------
 @app.get("/ui", response_class=HTMLResponse)
 def ui():
     return """
@@ -236,8 +312,8 @@ def ui():
     body{font-family:Arial, sans-serif; max-width:760px; margin:40px auto; padding:0 16px;}
     .card{border:1px solid #ddd; border-radius:12px; padding:16px; margin:12px 0;}
     label{display:block; margin:10px 0 6px;}
-    input,select,button{padding:10px; font-size:14px;}
-    input,select{width:100%;}
+    input,button{padding:10px; font-size:14px;}
+    input{width:100%;}
     button{cursor:pointer;}
     pre{background:#111; color:#0f0; padding:12px; border-radius:8px; overflow:auto;}
     small{color:#555;}
@@ -249,7 +325,7 @@ def ui():
     <p><small>1) Escolhe a empresa (ID)  2) Seleciona o ficheiro (.xlsx ou .csv)  3) Importar</small></p>
 
     <label for="companyId">Company ID</label>
-    <input id="companyId" type="number" value="3" min="1" />
+    <input id="companyId" type="number" value="1" min="1" />
 
     <label for="file">Ficheiro (CSV/XLSX)</label>
     <input id="file" type="file" accept=".csv,.xlsx,.xls" />
@@ -258,6 +334,7 @@ def ui():
       <button id="btnImport">Importar</button>
       <button id="btnList">Listar Empresas</button>
       <button id="btnInvoices">Ver Faturas da Empresa</button>
+      <button id="btnDashboard" onclick="location.href='/dashboard'">Abrir Dashboard</button>
     </div>
   </div>
 
@@ -309,6 +386,9 @@ document.getElementById("btnInvoices").onclick = listInvoices;
 </body>
 </html>
 """
+
+
+# ---------------- Dashboard (/dashboard) ----------------
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
     return """
@@ -324,7 +404,7 @@ def dashboard():
     .row{display:flex; gap:12px; flex-wrap:wrap; align-items:end;}
     .card{border:1px solid #e5e5e5; border-radius:14px; padding:14px; margin:12px 0;}
     label{display:block; margin:8px 0 6px; font-size:13px; color:#333;}
-    input,select,button{padding:10px; font-size:14px; border-radius:10px; border:1px solid #ccc;}
+    input,button{padding:10px; font-size:14px; border-radius:10px; border:1px solid #ccc;}
     button{cursor:pointer; background:#fff;}
     button.primary{border-color:#333;}
     button:disabled{opacity:.5; cursor:not-allowed;}
@@ -344,11 +424,12 @@ def dashboard():
     .success{color:#0a7;}
     .error{color:#b00;}
     .wrap{white-space:nowrap;}
+    pre{background:#111; color:#0f0; padding:12px; border-radius:12px; overflow:auto;}
   </style>
 </head>
 <body>
   <h1>Dashboard de Faturas</h1>
-  <div class="muted">Carrega Excel/CSV e gere faturas (vencidas / a vencer / pagas).</div>
+  <div class="muted">Carrega Excel/CSV e gere faturas (vencidas / a vencer / pagas). Inclui alertas fixos (ex.: leasing débito direto).</div>
 
   <div class="card">
     <div class="row">
@@ -365,10 +446,12 @@ def dashboard():
       <div class="right">
         <button class="primary" id="btnImport">Importar</button>
         <button id="btnCompanies">Listar Empresas</button>
+        <button id="btnUI" onclick="location.href='/ui'">Voltar ao Import</button>
       </div>
     </div>
 
     <div id="msg" class="small muted" style="margin-top:10px;"></div>
+    <div id="recurringBox" class="small muted" style="margin-top:8px;"></div>
   </div>
 
   <div class="card">
@@ -415,19 +498,20 @@ def dashboard():
     </div>
 
     <div class="muted small" style="margin-top:10px;">
-      Dica: “Importadas=0 / Atualizadas>0” significa que já existiam e foram atualizadas (sem duplicar).
+      Dica: “Importadas=0 / Atualizadas&gt;0” significa que já existiam e foram atualizadas (sem duplicar).
     </div>
   </div>
 
   <div class="card">
     <div class="muted">Saída técnica (debug)</div>
-    <pre id="out" class="mono small" style="background:#111; color:#0f0; padding:12px; border-radius:12px; overflow:auto;">{}</pre>
+    <pre id="out" class="mono small">{}</pre>
   </div>
 
 <script>
 const tbody = document.getElementById("tbody");
 const out = document.getElementById("out");
 const msg = document.getElementById("msg");
+const recurringBox = document.getElementById("recurringBox");
 const companyIdEl = document.getElementById("companyId");
 const daysEl = document.getElementById("days");
 const qEl = document.getElementById("q");
@@ -441,6 +525,10 @@ function showOut(x){
 function setMsg(text, kind="muted"){
   msg.className = "small " + kind;
   msg.textContent = text || "";
+}
+function setRecurring(text, kind="muted"){
+  recurringBox.className = "small " + kind;
+  recurringBox.textContent = text || "";
 }
 
 function badge(cat){
@@ -485,13 +573,24 @@ function render(items){
     `;
   }).join("");
 
-  // bind actions
   document.querySelectorAll("button[data-pay]").forEach(btn => {
     btn.onclick = async () => {
       const id = btn.getAttribute("data-pay");
       await markPaid(id);
     };
   });
+}
+
+async function fetchRecurring(){
+  const companyId = companyIdEl.value;
+  const r = await fetch(`/companies/${companyId}/recurring`);
+  const text = await r.text();
+  try{
+    const j = JSON.parse(text);
+    return Array.isArray(j) ? j : [];
+  }catch(e){
+    return [];
+  }
 }
 
 async function fetchInvoices(){
@@ -504,13 +603,24 @@ async function fetchInvoices(){
   if(currentFilter === "paid") url += `?status=paid&days=${days}`;
 
   setMsg("A carregar faturas...", "muted");
+  setRecurring("", "muted");
+
+  // alertas fixos (leasing etc.)
+  const recurring = await fetchRecurring();
+  if(recurring.length){
+    const sorted = recurring.sort((a,b)=>a.dias_faltam-b.dias_faltam);
+    const first = sorted[0];
+    const txt = sorted.map(x => `⚠️ ${x.descricao} (${x.metodo}) — próximo: ${x.proximo_debito} (${x.dias_faltam} dias)`).join(" | ");
+    setRecurring(txt, first.dias_faltam <= 7 ? "error" : "success");
+  }
+
   const r = await fetch(url);
   const text = await r.text();
   try{
     const j = JSON.parse(text);
     showOut(j);
     render(j.items || []);
-    setMsg(`OK — ${ (j.items||[]).length } faturas carregadas.`, "success");
+    setMsg(`OK — ${(j.items||[]).length} faturas carregadas.`, "success");
   }catch(e){
     showOut(text);
     setMsg("Erro ao carregar faturas (ver saída técnica).", "error");
@@ -578,7 +688,6 @@ async function markPaid(invoiceId){
   }
 }
 
-// filters
 document.querySelectorAll(".filters button").forEach(b => {
   b.onclick = async () => {
     document.querySelectorAll(".filters button").forEach(x => x.classList.remove("primary"));
@@ -593,7 +702,6 @@ document.getElementById("btnCompanies").onclick = listCompanies;
 document.getElementById("btnRefresh").onclick = fetchInvoices;
 qEl.oninput = () => render(lastItems);
 
-// auto-load
 setTimeout(fetchInvoices, 200);
 </script>
 </body>
