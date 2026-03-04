@@ -3,3 +3,4 @@ uvicorn
 sqlmodel
 pandas
 openpyxl
+python-multipart
