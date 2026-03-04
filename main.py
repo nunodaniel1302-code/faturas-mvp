@@ -2,6 +2,7 @@ from datetime import date, datetime, timedelta
 from typing import Optional, List
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from sqlmodel import SQLModel, Field, Session, create_engine, select
@@ -222,3 +223,89 @@ def mark_invoice_paid(invoice_id: int):
         session.add(inv)
         session.commit()
         return {"ok": True, "invoice_id": invoice_id}
+@app.get("/ui", response_class=HTMLResponse)
+def ui():
+    return """
+<!doctype html>
+<html lang="pt">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Importar Faturas</title>
+  <style>
+    body{font-family:Arial, sans-serif; max-width:760px; margin:40px auto; padding:0 16px;}
+    .card{border:1px solid #ddd; border-radius:12px; padding:16px; margin:12px 0;}
+    label{display:block; margin:10px 0 6px;}
+    input,select,button{padding:10px; font-size:14px;}
+    input,select{width:100%;}
+    button{cursor:pointer;}
+    pre{background:#111; color:#0f0; padding:12px; border-radius:8px; overflow:auto;}
+    small{color:#555;}
+  </style>
+</head>
+<body>
+  <h1>Importar Faturas</h1>
+  <div class="card">
+    <p><small>1) Escolhe a empresa (ID)  2) Seleciona o ficheiro (.xlsx ou .csv)  3) Importar</small></p>
+
+    <label for="companyId">Company ID</label>
+    <input id="companyId" type="number" value="3" min="1" />
+
+    <label for="file">Ficheiro (CSV/XLSX)</label>
+    <input id="file" type="file" accept=".csv,.xlsx,.xls" />
+
+    <div style="margin-top:12px; display:flex; gap:10px; flex-wrap:wrap;">
+      <button id="btnImport">Importar</button>
+      <button id="btnList">Listar Empresas</button>
+      <button id="btnInvoices">Ver Faturas da Empresa</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Resultado</h3>
+    <pre id="out">{}</pre>
+  </div>
+
+<script>
+const out = document.getElementById("out");
+function show(x){ out.textContent = typeof x === "string" ? x : JSON.stringify(x, null, 2); }
+
+async function listCompanies(){
+  const r = await fetch("/companies");
+  const j = await r.json();
+  show(j);
+}
+
+async function listInvoices(){
+  const companyId = document.getElementById("companyId").value;
+  const r = await fetch(`/companies/${companyId}/invoices`);
+  const j = await r.json();
+  show(j);
+}
+
+async function importFile(){
+  const companyId = document.getElementById("companyId").value;
+  const f = document.getElementById("file").files[0];
+  if(!companyId) return show("Falta companyId");
+  if(!f) return show("Seleciona um ficheiro primeiro (.xlsx ou .csv)");
+
+  const fd = new FormData();
+  fd.append("file", f);
+
+  const r = await fetch(`/companies/${companyId}/invoices/import`, {
+    method: "POST",
+    body: fd
+  });
+
+  const text = await r.text();
+  try { show(JSON.parse(text)); }
+  catch(e){ show(text); }
+}
+
+document.getElementById("btnImport").onclick = importFile;
+document.getElementById("btnList").onclick = listCompanies;
+document.getElementById("btnInvoices").onclick = listInvoices;
+</script>
+</body>
+</html>
+"""
